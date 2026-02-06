@@ -11,6 +11,7 @@ import logging
 import os
 import time
 from typing import Any
+from uuid import uuid4
 
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
@@ -28,6 +29,9 @@ from ollama import AsyncClient  # pyright: ignore[reportAttributeAccessIssue]
 from ollama import ResponseError  # pyright: ignore[reportAttributeAccessIssue]
 
 logger = logging.getLogger(__name__)
+
+# Unified default context length used when model metadata is unavailable
+DEFAULT_CONTEXT_LENGTH = 8192
 
 
 class OllamaChatResponse(ChatResponse):
@@ -66,12 +70,20 @@ def _truncate_values(
             return obj[:max_length] + f"... ({len(obj)} chars)"
         return obj
     if isinstance(obj, dict):
-        return {k: _truncate_values(v, max_length, max_depth, _depth + 1) for k, v in obj.items()}
+        return {
+            k: _truncate_values(v, max_length, max_depth, _depth + 1)
+            for k, v in obj.items()
+        }
     if isinstance(obj, list):
         if len(obj) > 10:
-            truncated = [_truncate_values(item, max_length, max_depth, _depth + 1) for item in obj[:10]]
+            truncated = [
+                _truncate_values(item, max_length, max_depth, _depth + 1)
+                for item in obj[:10]
+            ]
             return truncated + [f"... ({len(obj)} items total)"]
-        return [_truncate_values(item, max_length, max_depth, _depth + 1) for item in obj]
+        return [
+            _truncate_values(item, max_length, max_depth, _depth + 1) for item in obj
+        ]
     return obj
 
 
@@ -102,7 +114,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     # Test connection but don't fail mount
     if not await provider._check_connection():
-        logger.warning(f"Ollama server at {host} is not reachable. Provider mounted but will fail on use.")
+        logger.warning(
+            f"Ollama server at {host} is not reachable. Provider mounted but will fail on use."
+        )
     else:
         logger.info(f"Mounted OllamaProvider at {host}")
 
@@ -120,7 +134,12 @@ class OllamaProvider:
     name = "ollama"
     api_label = "Ollama"
 
-    def __init__(self, host: str | None = None, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None):
+    def __init__(
+        self,
+        host: str | None = None,
+        config: dict[str, Any] | None = None,
+        coordinator: ModuleCoordinator | None = None,
+    ):
         """
         Initialize Ollama provider.
 
@@ -141,17 +160,52 @@ class OllamaProvider:
         self.default_model = self.config.get("default_model", "llama3.2:3b")
         self.max_tokens = self.config.get("max_tokens", 4096)
         self.temperature = self.config.get("temperature", 0.7)
-        self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
+        self.timeout = float(
+            self.config.get("timeout", 600.0)
+        )  # API timeout in seconds (default 10 min - local models need longer for prefill)
         self.auto_pull = self.config.get("auto_pull", False)
         self.debug = self.config.get("debug", False)
-        self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
+        self.raw_debug = self.config.get(
+            "raw_debug", False
+        )  # Enable ultra-verbose raw API I/O logging
         # Context window size (num_ctx in ollama) - 0 means auto-detect from model
-        self.num_ctx = self.config.get("num_ctx", 0)
+        self.num_ctx = int(self.config.get("num_ctx", 0))
         # Cache for model context lengths (avoid repeated API calls)
         self._model_ctx_cache: dict[str, int] = {}
         # Enable thinking/reasoning for models that support it (default: True)
         # Models that don't support thinking will simply ignore this option
         self.enable_thinking = self.config.get("enable_thinking", True)
+        # Thinking effort level: None (boolean True), or "high"/"medium"/"low"
+        self.thinking_effort: str | None = self.config.get("thinking_effort")
+
+        # Sampling parameters (3-tier precedence: request -> kwargs -> instance default)
+        # Only forwarded to Ollama when explicitly set (never send None)
+        self.top_p: float | None = self.config.get("top_p")
+        self.top_k: int | None = self.config.get("top_k")
+        self.min_p: float | None = self.config.get("min_p")
+        self.repeat_penalty: float | None = self.config.get("repeat_penalty")
+        self.seed: int | None = self.config.get("seed")
+        self.stop: list[str] | None = self.config.get("stop")
+
+        # Keep model loaded in memory (e.g. "5m", "1h", "-1s" for indefinite)
+        # Normalize bare numeric values like "-1" or "0" to include "s" unit suffix
+        # since Ollama's duration parser requires a unit
+        _keep_alive_raw = self.config.get("keep_alive")
+        if _keep_alive_raw is not None:
+            _ka_str = str(_keep_alive_raw).strip()
+            # If it's a bare number (int/float, possibly negative), append "s"
+            try:
+                float(_ka_str)
+                _ka_str = f"{_ka_str}s"
+            except ValueError:
+                pass  # Already has a unit suffix like "5m", "1h"
+            self.keep_alive: str | None = _ka_str
+        else:
+            self.keep_alive: str | None = None
+
+        # Logprobs support (requires Ollama >= 0.12.11)
+        self.logprobs: bool | None = self.config.get("logprobs")
+        self.top_logprobs: int | None = self.config.get("top_logprobs")
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
@@ -179,7 +233,7 @@ class OllamaProvider:
                 "model": "llama3.2:3b",
                 "max_tokens": 4096,
                 "temperature": 0.7,
-                "timeout": 300.0,
+                "timeout": 600.0,
                 "context_window": 128000,
                 "max_output_tokens": 64000,
             },
@@ -188,7 +242,7 @@ class OllamaProvider:
                     id="host",
                     display_name="Ollama Host",
                     field_type="text",
-                    prompt="Enter Ollama server URL",
+                    prompt="Ollama server URL",
                     env_var="OLLAMA_HOST",
                     default="http://localhost:11434",
                     required=False,
@@ -201,18 +255,110 @@ class OllamaProvider:
                     default="false",
                     required=False,
                 ),
+                ConfigField(
+                    id="enable_thinking",
+                    display_name="Enable Thinking",
+                    field_type="boolean",
+                    prompt="Enable thinking/reasoning for supported models?",
+                    required=False,
+                    default="true",
+                ),
+                ConfigField(
+                    id="keep_alive",
+                    display_name="Keep Alive",
+                    field_type="text",
+                    prompt="Model keep-alive duration (e.g., '5m', '-1' for indefinite)",
+                    required=False,
+                ),
+                ConfigField(
+                    id="num_ctx",
+                    display_name="Context Window Override",
+                    field_type="text",
+                    prompt="Context window size override (0 = auto-detect from model)",
+                    required=False,
+                    default="0",
+                ),
+                ConfigField(
+                    id="timeout",
+                    display_name="Request Timeout",
+                    field_type="text",
+                    prompt="API request timeout in seconds (large models need longer for prefill)",
+                    required=False,
+                    default="600",
+                ),
             ],
         )
+
+    def _detect_model_capabilities(self, model_name: str) -> list[str]:
+        """Detect capabilities based on model name/family.
+
+        Uses string matching on model names to determine what features
+        a model supports, following the same pattern as the Anthropic
+        provider's family-based capability detection.
+
+        Args:
+            model_name: The model identifier (e.g., "deepseek-r1:14b", "qwen3-coder-next")
+
+        Returns:
+            List of capability strings
+        """
+        name_lower = model_name.lower()
+        caps = ["streaming", "local"]
+
+        # Most models support tools now
+        caps.append("tools")
+
+        # Thinking/reasoning models
+        thinking_families = [
+            "deepseek-r1",
+            "qwen3:",
+            "qwq",
+            "magistral",
+            "cogito",
+        ]
+        # Non-thinking models that should NOT get thinking even if they match above
+        # e.g., qwen3-coder-next is explicitly non-thinking
+        non_thinking = ["qwen3-coder"]
+        is_non_thinking = any(f in name_lower for f in non_thinking)
+        if not is_non_thinking and any(f in name_lower for f in thinking_families):
+            caps.append("thinking")
+
+        # Vision/multimodal models
+        vision_families = [
+            "llava",
+            "llama3.2-vision",
+            "gemma3",
+            "qwen3-vl",
+            "qwen2.5-vl",
+            "deepseek-ocr",
+            "glm-ocr",
+            "minicpm-v",
+        ]
+        if any(f in name_lower for f in vision_families):
+            caps.append("vision")
+
+        # Fast/small models (useful for routing decisions)
+        fast_indicators = [":1b", ":3b", ":7b", "gemma3n", "phi3:mini", "phi4-mini"]
+        if any(f in name_lower for f in fast_indicators):
+            caps.append("fast")
+
+        # JSON/structured output (most modern models support this)
+        caps.append("json_mode")
+
+        return caps
 
     async def list_models(self) -> list[ModelInfo]:
         """
         List available models from local Ollama server.
 
         Queries the Ollama API to get list of installed models.
-        Raises exception if server is unreachable (no fallback - caller handles errors).
+        Returns empty list if server is unreachable (allows wizard to fall back to manual input).
         """
-        # Let exceptions propagate - connection errors should be shown to user
-        response = await self.client.list()
+        try:
+            response = await self.client.list()
+        except (ConnectionError, OSError, TimeoutError) as e:
+            logger.warning("Could not connect to Ollama server: %s", e)
+            return []
         models = []
         # response.models is a list of Model objects with .model attribute (not .name)
         for model in response.models:
@@ -220,15 +366,20 @@ class OllamaProvider:
             if model_name:
                 # Extract details - model.details is a ModelDetails object
                 details = model.details
-                context_length = getattr(details, "context_length", None) or 4096
+                context_length = (
+                    getattr(details, "context_length", None) or DEFAULT_CONTEXT_LENGTH
+                )
                 models.append(
                     ModelInfo(
                         id=model_name,
                         display_name=model_name,
                         context_window=context_length,
                         max_output_tokens=context_length,
-                        capabilities=["tools", "streaming", "local"],
-                        defaults={"temperature": 0.7, "max_tokens": 4096},
+                        capabilities=self._detect_model_capabilities(model_name),
+                        defaults={
+                            "temperature": 0.7,
+                            "max_tokens": DEFAULT_CONTEXT_LENGTH,
+                        },
                     )
                 )
         return models
@@ -258,7 +409,9 @@ class OllamaProvider:
                         logger.error(f"Failed to pull model {model}: {pull_error}")
                         return False
                 else:
-                    logger.warning(f"Model {model} not found. Set auto_pull=True or run 'ollama pull {model}'")
+                    logger.warning(
+                        f"Model {model} not found. Set auto_pull=True or run 'ollama pull {model}'"
+                    )
                     return False
             return False
 
@@ -282,7 +435,11 @@ class OllamaProvider:
             # Query model info from ollama
             info = await self.client.show(model)
             # modelinfo (no underscore) contains context_length (e.g., "gptoss.context_length": 131072)
-            model_info = getattr(info, "modelinfo", None) or getattr(info, "model_info", None) or {}
+            model_info = (
+                getattr(info, "modelinfo", None)
+                or getattr(info, "model_info", None)
+                or {}
+            )
 
             # Look for context_length in various formats
             ctx_length = None
@@ -299,9 +456,59 @@ class OllamaProvider:
             logger.debug(f"Could not get context_length for {model}: {e}")
 
         # Default fallback
-        default_ctx = 8192
-        self._model_ctx_cache[model] = default_ctx
-        return default_ctx
+        self._model_ctx_cache[model] = DEFAULT_CONTEXT_LENGTH
+        return DEFAULT_CONTEXT_LENGTH
+
+    # ── Retry logic for transient connection errors ──────────────────────
+
+    MAX_RETRIES = 3
+    BASE_RETRY_DELAY = 1.0  # seconds
+
+    async def _retry_with_backoff(self, coro_factory, description: str = "API call"):
+        """Retry a coroutine with exponential backoff for transient errors.
+
+        Only retries on connection-level failures (server down, network timeout,
+        OS-level socket errors). API errors from Ollama (model not found, etc.)
+        are never retried.
+
+        Args:
+            coro_factory: Zero-arg callable that returns the awaitable to retry.
+            description: Human-readable label for logging/events.
+
+        Returns:
+            The result of the awaitable on success.
+
+        Raises:
+            The last transient error after all retries are exhausted,
+            or any ResponseError immediately.
+        """
+        last_error: Exception | None = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                return await coro_factory()
+            except (ConnectionError, TimeoutError, OSError) as e:
+                last_error = e
+                if attempt < self.MAX_RETRIES - 1:
+                    delay = self.BASE_RETRY_DELAY * (2**attempt)
+                    logger.warning(
+                        f"[PROVIDER] Ollama {description} failed (attempt {attempt + 1}/{self.MAX_RETRIES}): {e}. "
+                        f"Retrying in {delay}s..."
+                    )
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            "ollama:retry",
+                            {
+                                "attempt": attempt + 1,
+                                "max_retries": self.MAX_RETRIES,
+                                "delay": delay,
+                                "error": str(e),
+                                "description": description,
+                            },
+                        )
+                    await asyncio.sleep(delay)
+            except ResponseError:
+                raise  # Don't retry API errors (model not found, invalid params, etc.)
+        raise last_error  # type: ignore[misc]
 
     async def complete(self, request: ChatRequest, **kwargs) -> OllamaChatResponse:
         """
@@ -319,7 +526,9 @@ class OllamaProvider:
             return await self._complete_streaming(request, **kwargs)
         return await self._complete_chat_request(request, **kwargs)
 
-    async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> OllamaChatResponse:
+    async def _complete_chat_request(
+        self, request: ChatRequest, **kwargs
+    ) -> OllamaChatResponse:
         """Handle ChatRequest format with developer message conversion.
 
         Args:
@@ -329,7 +538,9 @@ class OllamaProvider:
         Returns:
             OllamaChatResponse with content blocks
         """
-        logger.info(f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages")
+        logger.info(
+            f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages"
+        )
 
         # Validate tool call sequences and repair if needed
         missing = self._find_missing_tool_results(request.messages)
@@ -344,7 +555,9 @@ class OllamaProvider:
 
             # Inject synthetic results and track repaired IDs to prevent infinite loops
             for call_id, tool_name, _ in missing:
-                extra_tool_messages.append(self._create_synthetic_result(call_id, tool_name))
+                extra_tool_messages.append(
+                    self._create_synthetic_result(call_id, tool_name)
+                )
                 # Track this ID so we don't detect it as missing again in future iterations
                 self._repaired_tool_ids.add(call_id)
 
@@ -356,7 +569,8 @@ class OllamaProvider:
                         "provider": self.name,
                         "repair_count": len(missing),
                         "repairs": [
-                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                            {"tool_call_id": call_id, "tool_name": tool_name}
+                            for call_id, tool_name, _ in missing
                         ],
                     },
                 )
@@ -364,7 +578,9 @@ class OllamaProvider:
         # Separate messages by role
         system_msgs = [m for m in request.messages if m.role == "system"]
         developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [m for m in request.messages if m.role in ("user", "assistant", "tool")]
+        conversation = [
+            m for m in request.messages if m.role in ("user", "assistant", "tool")
+        ]
 
         # Build ollama messages list
         ollama_messages = []
@@ -381,7 +597,9 @@ class OllamaProvider:
             ollama_messages.append({"role": "user", "content": wrapped})
 
         # Convert conversation messages
-        conversation_msgs = self._convert_messages([m.model_dump() for m in conversation])
+        conversation_msgs = self._convert_messages(
+            [m.model_dump() for m in conversation]
+        )
         ollama_messages.extend(conversation_msgs)
 
         # Append synthetic tool results for any missing tool calls
@@ -389,23 +607,60 @@ class OllamaProvider:
 
         # Prepare request parameters
         model = kwargs.get("model", self.default_model)
-        params = {
-            "model": model,
-            "messages": ollama_messages,
-            "options": {
-                "temperature": request.temperature or kwargs.get("temperature", self.temperature),
-                "num_predict": request.max_output_tokens or kwargs.get("max_tokens", self.max_tokens),
-            },
+
+        # Ensure model is available (auto-pull if configured)
+        if self.auto_pull:
+            await self._ensure_model_available(model)
+
+        # Build options dict with 3-tier precedence: request -> kwargs -> instance default
+        options: dict[str, Any] = {
+            "temperature": request.temperature
+            or kwargs.get("temperature", self.temperature),
+            "num_predict": request.max_output_tokens
+            or kwargs.get("max_tokens", self.max_tokens),
         }
+
+        # Sampling parameters - only include when explicitly set
+        if (top_p := kwargs.get("top_p", self.top_p)) is not None:
+            options["top_p"] = top_p
+        if (top_k := kwargs.get("top_k", self.top_k)) is not None:
+            options["top_k"] = top_k
+        if (min_p := kwargs.get("min_p", self.min_p)) is not None:
+            options["min_p"] = min_p
+        if (
+            repeat_penalty := kwargs.get("repeat_penalty", self.repeat_penalty)
+        ) is not None:
+            options["repeat_penalty"] = repeat_penalty
+        if (seed := kwargs.get("seed", self.seed)) is not None:
+            options["seed"] = seed
 
         # Set context window size (num_ctx controls how much context ollama uses)
         # If num_ctx is configured, use it; otherwise auto-detect from model
         if self.num_ctx > 0:
-            params["options"]["num_ctx"] = self.num_ctx
+            options["num_ctx"] = self.num_ctx
         else:
-            # Auto-detect context length from model info
             ctx_length = await self._get_model_context_length(model)
-            params["options"]["num_ctx"] = ctx_length
+            options["num_ctx"] = ctx_length
+
+        params: dict[str, Any] = {
+            "model": model,
+            "messages": ollama_messages,
+            "options": options,
+        }
+
+        # Stop sequences - top-level param for Ollama SDK
+        if (stop := kwargs.get("stop", self.stop)) is not None:
+            params["stop"] = stop
+
+        # Keep model loaded in memory
+        if self.keep_alive is not None:
+            params["keep_alive"] = self.keep_alive
+
+        # Logprobs support (Ollama >= 0.12.11) - top-level params
+        if logprobs := kwargs.get("logprobs", self.logprobs):
+            params["logprobs"] = logprobs
+        if top_logprobs := kwargs.get("top_logprobs", self.top_logprobs):
+            params["top_logprobs"] = top_logprobs
 
         # Add tools if provided
         if request.tools:
@@ -420,16 +675,18 @@ class OllamaProvider:
                 # Simple JSON mode
                 params["format"] = "json"
 
-        # Enable thinking/reasoning if requested or if provider config enables it
-        # Models that don't support thinking will simply ignore the think option
+        # Enable thinking/reasoning only for models that support it
+        # think is a top-level parameter (not inside options) since Ollama v0.9.0
+        # Supports boolean True or effort levels: "high", "medium", "low"
         include_thinking = False
-        if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
-            params["options"]["think"] = True
-            include_thinking = True
-        elif self.enable_thinking:
-            # Provider config enables thinking by default
-            params["options"]["think"] = True
-            include_thinking = True
+        model_caps = self._detect_model_capabilities(model)
+        if "thinking" in model_caps:
+            if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
+                params["think"] = self.thinking_effort or True
+                include_thinking = True
+            elif self.enable_thinking:
+                params["think"] = self.thinking_effort or True
+                include_thinking = True
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -473,14 +730,20 @@ class OllamaProvider:
 
         start_time = time.time()
 
-        # Call Ollama API with timeout
+        # Call Ollama API with timeout and retry for transient errors
         try:
-            raw_response = await asyncio.wait_for(
-                self.client.chat(**params),
-                timeout=self.timeout,
+            raw_response = await self._retry_with_backoff(
+                lambda: asyncio.wait_for(
+                    self.client.chat(**params), timeout=self.timeout
+                ),
+                description=f"chat completion ({model})",
             )
             # Convert Pydantic model to dict for consistent access
-            response = raw_response.model_dump() if hasattr(raw_response, "model_dump") else dict(raw_response)
+            response = (
+                raw_response.model_dump()
+                if hasattr(raw_response, "model_dump")
+                else dict(raw_response)
+            )
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             logger.info("[PROVIDER] Received response from Ollama API")
@@ -533,7 +796,9 @@ class OllamaProvider:
                     )
 
             # Convert to OllamaChatResponse
-            return self._convert_to_chat_response(response, include_thinking=include_thinking)
+            return self._convert_to_chat_response(
+                response, include_thinking=include_thinking
+            )
 
         except TimeoutError:
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -571,7 +836,9 @@ class OllamaProvider:
                 )
             raise
 
-    async def _complete_streaming(self, request: ChatRequest, **kwargs) -> OllamaChatResponse:
+    async def _complete_streaming(
+        self, request: ChatRequest, **kwargs
+    ) -> OllamaChatResponse:
         """Handle streaming completion with event emission.
 
         Args:
@@ -581,10 +848,9 @@ class OllamaProvider:
         Returns:
             OllamaChatResponse with accumulated content
         """
-        from amplifier_core.message_models import TextBlock
-        from amplifier_core.message_models import Usage
-
-        logger.info(f"[PROVIDER] Streaming request with {len(request.messages)} messages")
+        logger.info(
+            f"[PROVIDER] Streaming request with {len(request.messages)} messages"
+        )
 
         # Validate tool call sequences (same as non-streaming)
         missing = self._find_missing_tool_results(request.messages)
@@ -599,7 +865,9 @@ class OllamaProvider:
 
             # Inject synthetic results and track repaired IDs to prevent infinite loops
             for call_id, tool_name, _ in missing:
-                extra_tool_messages.append(self._create_synthetic_result(call_id, tool_name))
+                extra_tool_messages.append(
+                    self._create_synthetic_result(call_id, tool_name)
+                )
                 # Track this ID so we don't detect it as missing again in future iterations
                 self._repaired_tool_ids.add(call_id)
 
@@ -611,7 +879,8 @@ class OllamaProvider:
                         "provider": self.name,
                         "repair_count": len(missing),
                         "repairs": [
-                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                            {"tool_call_id": call_id, "tool_name": tool_name}
+                            for call_id, tool_name, _ in missing
                         ],
                     },
                 )
@@ -619,7 +888,9 @@ class OllamaProvider:
         # Separate messages by role
         system_msgs = [m for m in request.messages if m.role == "system"]
         developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [m for m in request.messages if m.role in ("user", "assistant", "tool")]
+        conversation = [
+            m for m in request.messages if m.role in ("user", "assistant", "tool")
+        ]
 
         # Build ollama messages list
         ollama_messages = []
@@ -633,32 +904,70 @@ class OllamaProvider:
             wrapped = f"<context_file>\n{content}\n</context_file>"
             ollama_messages.append({"role": "user", "content": wrapped})
 
-        conversation_msgs = self._convert_messages([m.model_dump() for m in conversation])
+        conversation_msgs = self._convert_messages(
+            [m.model_dump() for m in conversation]
+        )
         ollama_messages.extend(conversation_msgs)
         ollama_messages.extend(extra_tool_messages)
 
         # Prepare request parameters
         model = kwargs.get("model", self.default_model)
+
+        # Ensure model is available (auto-pull if configured)
+        if self.auto_pull:
+            await self._ensure_model_available(model)
+
+        # Build options dict with 3-tier precedence: request -> kwargs -> instance default
+        options: dict[str, Any] = {
+            "temperature": request.temperature
+            or kwargs.get("temperature", self.temperature),
+            "num_predict": request.max_output_tokens
+            or kwargs.get("max_tokens", self.max_tokens),
+        }
+
+        # Sampling parameters - only include when explicitly set
+        if (top_p := kwargs.get("top_p", self.top_p)) is not None:
+            options["top_p"] = top_p
+        if (top_k := kwargs.get("top_k", self.top_k)) is not None:
+            options["top_k"] = top_k
+        if (min_p := kwargs.get("min_p", self.min_p)) is not None:
+            options["min_p"] = min_p
+        if (
+            repeat_penalty := kwargs.get("repeat_penalty", self.repeat_penalty)
+        ) is not None:
+            options["repeat_penalty"] = repeat_penalty
+        if (seed := kwargs.get("seed", self.seed)) is not None:
+            options["seed"] = seed
+
+        # Set context window size (num_ctx controls how much context ollama uses)
+        if self.num_ctx > 0:
+            options["num_ctx"] = self.num_ctx
+        else:
+            ctx_length = await self._get_model_context_length(model)
+            options["num_ctx"] = ctx_length
+
         params: dict[str, Any] = {
             "model": model,
             "messages": ollama_messages,
-            "options": {
-                "temperature": request.temperature or kwargs.get("temperature", self.temperature),
-                "num_predict": request.max_output_tokens or kwargs.get("max_tokens", self.max_tokens),
-            },
+            "options": options,
             "stream": True,
         }
 
-        # Set context window size (num_ctx controls how much context ollama uses)
-        # If num_ctx is configured, use it; otherwise auto-detect from model
-        if self.num_ctx > 0:
-            params["options"]["num_ctx"] = self.num_ctx
-        else:
-            # Auto-detect context length from model info
-            ctx_length = await self._get_model_context_length(model)
-            params["options"]["num_ctx"] = ctx_length
+        # Stop sequences - top-level param for Ollama SDK
+        if (stop := kwargs.get("stop", self.stop)) is not None:
+            params["stop"] = stop
 
-        # Add tools if provided (note: tool calls may not work well with streaming)
+        # Keep model loaded in memory
+        if self.keep_alive is not None:
+            params["keep_alive"] = self.keep_alive
+
+        # Logprobs support (Ollama >= 0.12.11) - top-level params
+        if logprobs := kwargs.get("logprobs", self.logprobs):
+            params["logprobs"] = logprobs
+        if top_logprobs := kwargs.get("top_logprobs", self.top_logprobs):
+            params["top_logprobs"] = top_logprobs
+
+        # Add tools if provided
         if request.tools:
             params["tools"] = self._format_tools_from_request(request.tools)
 
@@ -669,16 +978,17 @@ class OllamaProvider:
             elif request.response_format == "json":
                 params["format"] = "json"
 
-        # Enable thinking/reasoning if requested or if provider config enables it
-        # Models that don't support thinking will simply ignore the think option
+        # Enable thinking/reasoning only for models that support it
+        # think is a top-level parameter (not inside options) since Ollama v0.9.0
         include_thinking = False
-        if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
-            params["options"]["think"] = True
-            include_thinking = True
-        elif self.enable_thinking:
-            # Provider config enables thinking by default
-            params["options"]["think"] = True
-            include_thinking = True
+        model_caps = self._detect_model_capabilities(model)
+        if "thinking" in model_caps:
+            if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
+                params["think"] = self.thinking_effort or True
+                include_thinking = True
+            elif self.enable_thinking:
+                params["think"] = self.thinking_effort or True
+                include_thinking = True
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -726,12 +1036,15 @@ class OllamaProvider:
         start_time = time.time()
         accumulated_content = ""
         accumulated_thinking = ""
+        accumulated_tool_calls: list[dict[str, Any]] = []
         final_chunk: dict[str, Any] | None = None
 
         try:
-            async for chunk in await asyncio.wait_for(
-                self.client.chat(**params),
-                timeout=self.timeout,
+            async for chunk in await self._retry_with_backoff(
+                lambda: asyncio.wait_for(
+                    self.client.chat(**params), timeout=self.timeout
+                ),
+                description=f"streaming chat ({model})",
             ):
                 message = chunk.get("message", {})
 
@@ -752,6 +1065,11 @@ class OllamaProvider:
                             "llm:stream:thinking",
                             {"thinking": message["thinking"], "provider": "ollama"},
                         )
+
+                # Accumulate tool calls from streaming chunks (supported since Ollama v0.8.0)
+                if message.get("tool_calls"):
+                    for tc in message["tool_calls"]:
+                        accumulated_tool_calls.append(tc)
 
                 if chunk.get("done"):
                     final_chunk = chunk
@@ -791,7 +1109,9 @@ class OllamaProvider:
                             "response": _truncate_values(
                                 {
                                     "content": accumulated_content,
-                                    "thinking": accumulated_thinking if accumulated_thinking else None,
+                                    "thinking": accumulated_thinking
+                                    if accumulated_thinking
+                                    else None,
                                     "final_chunk": final_chunk,
                                 }
                             ),
@@ -810,7 +1130,9 @@ class OllamaProvider:
                             "stream": True,
                             "response": {
                                 "content": accumulated_content,
-                                "thinking": accumulated_thinking if accumulated_thinking else None,
+                                "thinking": accumulated_thinking
+                                if accumulated_thinking
+                                else None,
                                 "final_chunk": final_chunk,
                             },
                             "status": "ok",
@@ -822,6 +1144,7 @@ class OllamaProvider:
             return self._build_streaming_response(
                 accumulated_content,
                 accumulated_thinking,
+                accumulated_tool_calls,
                 final_chunk,
                 include_thinking,
             )
@@ -865,6 +1188,7 @@ class OllamaProvider:
         self,
         content: str,
         thinking: str,
+        accumulated_tool_calls: list[dict[str, Any]],
         final_chunk: dict[str, Any] | None,
         include_thinking: bool,
     ) -> OllamaChatResponse:
@@ -873,17 +1197,22 @@ class OllamaProvider:
         Args:
             content: Accumulated content text
             thinking: Accumulated thinking text
+            accumulated_tool_calls: Tool calls accumulated during streaming
             final_chunk: Final chunk with usage info
             include_thinking: Whether thinking was requested
 
         Returns:
-            OllamaChatResponse with accumulated content
+            OllamaChatResponse with accumulated content and tool calls
         """
         from amplifier_core.message_models import TextBlock
+        from amplifier_core.message_models import ToolCallBlock
         from amplifier_core.message_models import Usage
 
         content_blocks = []  # For context storage (message_models: ThinkingBlock, TextBlock, etc.)
-        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []  # For streaming UI events
+        event_blocks: list[
+            TextContent | ThinkingContent | ToolCallContent
+        ] = []  # For streaming UI events
+        tool_calls = []
         thinking_content = None
 
         # Add thinking block if present (always include when model returns it)
@@ -904,24 +1233,56 @@ class OllamaProvider:
             # Also add to event_blocks for streaming UI hooks
             event_blocks.append(TextContent(text=content))
 
+        # Process accumulated tool calls (same parsing as non-streaming path)
+        for tc in accumulated_tool_calls:
+            function = (
+                tc.get("function", {})
+                if isinstance(tc, dict)
+                else getattr(tc, "function", {})
+            )
+            if isinstance(function, dict):
+                tool_name = function.get("name", "")
+                tool_args = function.get("arguments", {})
+            else:
+                tool_name = getattr(function, "name", "")
+                tool_args = getattr(function, "arguments", {})
+            tool_id = (
+                tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
+            ) or f"call_{uuid4().hex[:8]}"
+
+            content_blocks.append(
+                ToolCallBlock(id=tool_id, name=tool_name, input=tool_args)
+            )
+            tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_args))
+            event_blocks.append(
+                ToolCallContent(id=tool_id, name=tool_name, arguments=tool_args)
+            )
+
         # Extract usage from final chunk
         usage = Usage(
             input_tokens=final_chunk.get("prompt_eval_count", 0) if final_chunk else 0,
             output_tokens=final_chunk.get("eval_count", 0) if final_chunk else 0,
             total_tokens=(
-                (final_chunk.get("prompt_eval_count", 0) + final_chunk.get("eval_count", 0)) if final_chunk else 0
+                (
+                    final_chunk.get("prompt_eval_count", 0)
+                    + final_chunk.get("eval_count", 0)
+                )
+                if final_chunk
+                else 0
             ),
         )
 
         return OllamaChatResponse(
             content=content_blocks,
-            tool_calls=None,  # Tool calls not fully supported in streaming
+            tool_calls=tool_calls if tool_calls else None,
             usage=usage,
-            finish_reason=None,
+            finish_reason=final_chunk.get("done_reason") if final_chunk else None,
             raw_response=final_chunk if self.raw_debug else None,
             model_name=final_chunk.get("model") if final_chunk else None,
             thinking_content=thinking_content,
-            content_blocks=event_blocks if event_blocks else None,  # For streaming UI events
+            content_blocks=event_blocks
+            if event_blocks
+            else None,  # For streaming UI events
             text=content or None,
         )
 
@@ -937,7 +1298,9 @@ class OllamaProvider:
         """
         return response.tool_calls or []
 
-    def _find_missing_tool_results(self, messages: list[Message]) -> list[tuple[str, str, dict]]:
+    def _find_missing_tool_results(
+        self, messages: list[Message]
+    ) -> list[tuple[str, str, dict]]:
         """Find tool calls without corresponding results.
 
         Scans message history to detect tool calls that were never answered
@@ -977,8 +1340,16 @@ class OllamaProvider:
                 if hasattr(msg, "tool_calls") and msg.tool_calls:  # pyright: ignore[reportAttributeAccessIssue]
                     for tc in msg.tool_calls:  # pyright: ignore[reportAttributeAccessIssue]
                         tc_id = tc.id if hasattr(tc, "id") else tc.get("id", "")
-                        tc_name = tc.name if hasattr(tc, "name") else tc.get("name", "unknown")
-                        tc_args = tc.arguments if hasattr(tc, "arguments") else tc.get("arguments", {})
+                        tc_name = (
+                            tc.name
+                            if hasattr(tc, "name")
+                            else tc.get("name", "unknown")
+                        )
+                        tc_args = (
+                            tc.arguments
+                            if hasattr(tc, "arguments")
+                            else tc.get("arguments", {})
+                        )
                         if tc_id:
                             tool_calls[tc_id] = (tc_name, tc_args)
             elif msg.role == "tool":
@@ -986,6 +1357,10 @@ class OllamaProvider:
                 tool_call_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else ""
                 if tool_call_id:
                     tool_results.add(tool_call_id)
+
+        # Bound memory: clear tracking set if it grows too large
+        if len(self._repaired_tool_ids) > 1000:
+            self._repaired_tool_ids.clear()
 
         # Exclude IDs that have already been repaired to prevent infinite loops
         return [
@@ -1041,6 +1416,8 @@ class OllamaProvider:
 
             # Handle structured content (list of content blocks from Amplifier)
             # Convert to plain string for Ollama which expects string content
+            # Extract base64 images for multimodal models (vision)
+            images: list[str] = []
             if isinstance(content, list):
                 text_parts = []
                 for block in content:
@@ -1048,7 +1425,16 @@ class OllamaProvider:
                         # TextContent block: {"type": "text", "text": "..."}
                         if block.get("type") == "text" and "text" in block:
                             text_parts.append(block["text"])
-                        # ToolCallContent or other blocks - skip for now
+                        # Image content block: {"type": "image", "source": {"type": "base64", "data": "..."}}
+                        elif block.get("type") == "image":
+                            source = block.get("source", {})
+                            if source.get("type") == "base64":
+                                images.append(source.get("data", ""))
+                            elif source.get("type") == "url":
+                                text_parts.append(
+                                    f"[Image URL: {source.get('url', '')}]"
+                                )
+                        # ToolCallContent, ThinkingContent, etc. - handled by role-specific logic
                     elif isinstance(block, str):
                         text_parts.append(block)
                 content = "\n".join(text_parts) if text_parts else ""
@@ -1068,11 +1454,20 @@ class OllamaProvider:
                             {
                                 "id": tc.get("id", ""),
                                 "type": "function",  # OpenAI requires this
-                                "function": {"name": tc.get("tool", ""), "arguments": tc.get("arguments", {})},
+                                "function": {
+                                    "name": tc.get("tool", ""),
+                                    "arguments": tc.get("arguments", {}),
+                                },
                             }
                         )
 
-                    ollama_messages.append({"role": "assistant", "content": content, "tool_calls": ollama_tool_calls})
+                    ollama_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": content,
+                            "tool_calls": ollama_tool_calls,
+                        }
+                    )
                 else:
                     # Regular assistant message
                     ollama_messages.append({"role": "assistant", "content": content})
@@ -1080,12 +1475,19 @@ class OllamaProvider:
             elif role == "tool":
                 # Tool result message
                 ollama_messages.append(
-                    {"role": "tool", "content": content, "tool_call_id": msg.get("tool_call_id", "")}
+                    {
+                        "role": "tool",
+                        "content": content,
+                        "tool_call_id": msg.get("tool_call_id", ""),
+                    }
                 )
 
             else:
-                # User, system, etc. - pass through
-                ollama_messages.append(msg)
+                # User, system, etc. - build message with optional images
+                out_msg: dict[str, Any] = {"role": role, "content": content}
+                if images:
+                    out_msg["images"] = images
+                ollama_messages.append(out_msg)
 
         return ollama_messages
 
@@ -1095,7 +1497,11 @@ class OllamaProvider:
 
         for tool in tools:
             # Get schema from tool if available
-            input_schema = getattr(tool, "input_schema", {"type": "object", "properties": {}, "required": []})
+            input_schema = getattr(
+                tool,
+                "input_schema",
+                {"type": "object", "properties": {}, "required": []},
+            )
 
             ollama_tools.append(
                 {
@@ -1133,7 +1539,9 @@ class OllamaProvider:
             )
         return ollama_tools
 
-    def _convert_to_chat_response(self, response: Any, include_thinking: bool = False) -> OllamaChatResponse:
+    def _convert_to_chat_response(
+        self, response: Any, include_thinking: bool = False
+    ) -> OllamaChatResponse:
         """Convert Ollama response to OllamaChatResponse format.
 
         Args:
@@ -1149,7 +1557,9 @@ class OllamaProvider:
         from amplifier_core.message_models import Usage
 
         content_blocks = []  # For context storage (message_models: ThinkingBlock, TextBlock, etc.)
-        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []  # For streaming UI events
+        event_blocks: list[
+            TextContent | ThinkingContent | ToolCallContent
+        ] = []  # For streaming UI events
         tool_calls = []
         thinking_content = None
         text_accumulator: list[str] = []
@@ -1181,20 +1591,27 @@ class OllamaProvider:
         if message.get("tool_calls"):
             for tc in message["tool_calls"]:
                 function = tc.get("function", {})
-                tool_id = tc.get("id", "")
+                tool_id = tc.get("id", "") or f"call_{uuid4().hex[:8]}"
                 tool_name = function.get("name", "")
                 tool_args = function.get("arguments", {})
 
-                content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_args))
-                tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_args))
+                content_blocks.append(
+                    ToolCallBlock(id=tool_id, name=tool_name, input=tool_args)
+                )
+                tool_calls.append(
+                    ToolCall(id=tool_id, name=tool_name, arguments=tool_args)
+                )
                 # Also add to event_blocks for streaming UI hooks
-                event_blocks.append(ToolCallContent(id=tool_id, name=tool_name, arguments=tool_args))
+                event_blocks.append(
+                    ToolCallContent(id=tool_id, name=tool_name, arguments=tool_args)
+                )
 
         # Build usage info
         usage = Usage(
             input_tokens=response.get("prompt_eval_count", 0),
             output_tokens=response.get("eval_count", 0),
-            total_tokens=response.get("prompt_eval_count", 0) + response.get("eval_count", 0),
+            total_tokens=response.get("prompt_eval_count", 0)
+            + response.get("eval_count", 0),
         )
 
         combined_text = "\n\n".join(text_accumulator).strip()
@@ -1203,10 +1620,12 @@ class OllamaProvider:
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
-            finish_reason=None,  # Ollama doesn't provide finish_reason
+            finish_reason=response.get("done_reason") or None,
             raw_response=response if self.raw_debug else None,
             model_name=response.get("model"),
             thinking_content=thinking_content,
-            content_blocks=event_blocks if event_blocks else None,  # For streaming UI events
+            content_blocks=event_blocks
+            if event_blocks
+            else None,  # For streaming UI events
             text=combined_text or None,
         )
